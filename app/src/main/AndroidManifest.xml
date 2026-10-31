@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- USB Host 非対応端末にもインストールでき、診断画面で非対応を表示できるよう required=false -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <!-- ネットワーク権限は要求しない（Wi-Fi / インターネットを一切使用しない） -->
+
+    <application
+        android:name=".C2MirrorApp"
+        android:allowBackup="false"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.C2Mirror">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|density|uiMode"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- プラグ&プレイ: Apple 機器の接続で起動／前面のアプリへ通知。
+                 「常にこのアプリを開く」を選ぶと以降は USB 権限ダイアログ無しで開始できる。 -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/device_filter" />
+        </activity>
+    </application>
+</manifest>

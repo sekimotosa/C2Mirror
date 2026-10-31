@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black">
+
+    <io.github.sekimotosa.c2mirror.ui.AspectRatioFrameLayout
+        android:id="@+id/videoContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center">
+
+        <SurfaceView
+            android:id="@+id/surface"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+    </io.github.sekimotosa.c2mirror.ui.AspectRatioFrameLayout>
+
+    <ScrollView
+        android:id="@+id/idlePanel"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#FF101418"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_horizontal"
+            android:orientation="vertical"
+            android:padding="24dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="24dp"
+                android:text="@string/app_name"
+                android:textColor="#FFFFFFFF"
+                android:textSize="34sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/subtitle"
+                android:textColor="#FFB0BEC5"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/tvUsbHost"
+                style="@style/StatusLine"
+                android:layout_marginTop="28dp" />
+
+            <TextView android:id="@+id/tvDevice" style="@style/StatusLine" />
+
+            <TextView android:id="@+id/tvPhase" style="@style/StatusLine" android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvError"
+                style="@style/StatusLine"
+                android:textColor="#FFFF8A80"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/btnStart"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:minWidth="200dp"
+                android:text="@string/start" />
+
+            <Switch
+                android:id="@+id/swAuto"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:checked="true"
+                android:text="@string/auto_start"
+                android:textColor="#FFECEFF1" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="20dp"
+                android:text="@string/hint"
+                android:textColor="#FF90A4AE"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/btnDiag"
+                style="@android:style/Widget.Material.Button.Borderless.Colored"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="@string/diagnostics" />
+        </LinearLayout>
+    </ScrollView>
+
+    <LinearLayout
+        android:id="@+id/streamOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:background="#99000000"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:padding="8dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/tvStream"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:textColor="#FFFFFFFF"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/btnDiag2"
+            style="@android:style/Widget.Material.Button.Borderless"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/diagnostics"
+            android:textColor="#FFFFFFFF" />
+
+        <Button
+            android:id="@+id/btnDisconnect"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/disconnect" />
+    </LinearLayout>
+</FrameLayout>

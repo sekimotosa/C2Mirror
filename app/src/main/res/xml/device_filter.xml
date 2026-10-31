@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Apple Inc. (0x05AC = 1452)。最終判定はアプリ内で USB 構成を確認して行う。 -->
+    <usb-device vendor-id="1452" />
+</resources>

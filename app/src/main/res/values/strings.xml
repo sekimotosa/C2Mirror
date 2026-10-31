@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">C2Mirror</string>
+    <string name="subtitle">iPhone 画面を USB-C で表示</string>
+    <string name="start">接続開始</string>
+    <string name="cancel">中止</string>
+    <string name="disconnect">切断</string>
+    <string name="diagnostics">診断情報</string>
+    <string name="auto_start">iPhone を接続したら自動でミラーリング開始</string>
+    <string name="hint">このアプリを開いたまま、iPhone を USB-C ケーブルで接続してください。自動的にミラーリングが始まります。\n\nUSB の許可ダイアログでは「このデバイスが接続されたら C2Mirror を開く」にチェックを入れると、次回以降は確認なしで開始できます。</string>
+    <string name="share">共有</string>
+    <string name="save">保存</string>
+    <string name="copy">コピー</string>
+</resources>
