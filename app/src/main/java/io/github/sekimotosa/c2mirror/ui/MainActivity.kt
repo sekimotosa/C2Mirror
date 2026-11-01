@@ -156,6 +156,7 @@ class MainActivity : Activity(), MirrorSession.StateObserver {
             else -> "待機中"
         }
         Phase.WAITING_PERMISSION -> "USB アクセスの許可を待っています…"
+        Phase.PAIRING -> pairingText(s) ?: "iPhone と接続を確認しています…"
         Phase.ACTIVATING -> "iPhone の画面転送モードを有効化中…"
         Phase.WAITING_REENUMERATION -> "iPhone の再接続を待っています…"
         Phase.CONNECTING -> "USB 接続を確立中…"

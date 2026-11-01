@@ -49,6 +49,11 @@ class UsbMux(
     private val inbuf = java.io.ByteArrayOutputStream()
     @Volatile var packetsIn = 0L; private set
     @Volatile var packetsOut = 0L; private set
+    /** 診断用にヘッダ部分（mux 16 + TCP 20 バイト以内）だけを 16 進で記録する件数 */
+    private var hexLogIn = 24
+    private var hexLogOut = 24
+
+    private fun hex(a: ByteArray, len: Int) = a.take(minOf(len, 36)).joinToString("") { "%02x".format(it) }
 
     // ---------- 送信 ----------
 
@@ -65,7 +70,9 @@ class UsbMux(
                 txSeq = (txSeq + 1) and 0xFFFF
             }
             b.put(payload)
-            usbWrite(b.array())
+            val out = b.array()
+            if (hexLogOut > 0) { hexLogOut--; log("mux> ${hex(out, out.size)} (${out.size}B)") }
+            usbWrite(out)
             packetsOut++
         }
     }
@@ -76,7 +83,6 @@ class UsbMux(
         sendPacket(PROTO_VERSION, vh)
         val major = versionReply.poll(timeoutMs, TimeUnit.MILLISECONDS)
             ?: throw IOException("usbmux: no VERSION reply")
-        version = major
         log("usbmux version $major")
         if (major >= 2) sendPacket(PROTO_SETUP, byteArrayOf(0x07))
         return major
@@ -119,16 +125,25 @@ class UsbMux(
 
     private fun handlePacket(protocol: Int, a: ByteArray, length: Int) {
         packetsIn++
+        if (hexLogIn > 0) { hexLogIn--; log("mux< ${hex(a, length)} (${length}B)") }
         val bb = ByteBuffer.wrap(a, 0, length)
         var hlen = 8
         if (version >= 2 && protocol != PROTO_VERSION && length >= 16 && bb.getInt(8) == MAGIC) {
             hlen = 16
-            // 相手の送信シーケンス番号を受信確認として返す
-            synchronized(writeLock) { rxSeq = bb.getShort(12).toInt() and 0xFFFF }
+            // usbmuxd と同じく、デバイスのヘッダの rx_seq を次の送信に使う
+            synchronized(writeLock) { rxSeq = bb.getShort(14).toInt() and 0xFFFF }
         }
         when (protocol) {
             PROTO_VERSION -> {
                 val major = if (length >= hlen + 4) bb.getInt(hlen) else 0
+                // 直後に届くパケットを正しいヘッダ長で解釈できるよう、受信スレッド上で即座に反映する
+                if (major == 1 || major == 2) {
+                    synchronized(writeLock) {
+                        version = major
+                        txSeq = 0
+                        rxSeq = 0xFFFF
+                    }
+                }
                 versionReply.offer(major)
             }
             PROTO_CONTROL -> {

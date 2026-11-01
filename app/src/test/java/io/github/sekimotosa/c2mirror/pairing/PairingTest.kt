@@ -105,6 +105,8 @@ class UsbMuxTest {
         val received = ByteArrayOutputStream()
         lateinit var mux: UsbMux
         var refuse = false
+        /** VERSION 応答と同じ USB 転送で、続けて v2 パケットを送る（実機で起きた競合の再現） */
+        var burstAfterVersion = false
         val lockdownIn = ByteArrayOutputStream()
 
         fun fromHost(p: ByteArray) {
@@ -119,7 +121,19 @@ class UsbMuxTest {
                 h = 16
             }
             when (proto) {
-                0 -> { version = 2; send(0, ByteBuffer.allocate(12).putInt(2).putInt(0).putInt(0).array(), v1 = true) }
+                0 -> {
+                    version = 2
+                    val v = ByteBuffer.allocate(20).putInt(0).putInt(20).putInt(2).putInt(0).putInt(0).array()
+                    if (burstAfterVersion) {
+                        // 続けて v2 ヘッダの TCP パケット（未知ポート宛）を同じ転送で送る
+                        val tcp = ByteBuffer.allocate(36).putInt(6).putInt(36).putInt(UsbMux.MAGIC).putShort(0).putShort(0)
+                            .putShort(62078.toShort()).putShort(9).putInt(0).putInt(0).put(0x50).put(UsbMux.TH_RST.toByte()).array()
+                        val both = v + tcp
+                        mux.onUsbData(both, 0, both.size)
+                    } else {
+                        send(0, ByteBuffer.allocate(12).putInt(2).putInt(0).putInt(0).array(), v1 = true)
+                    }
+                }
                 2 -> assertArrayEquals(byteArrayOf(7), p.copyOfRange(h, p.size))
                 6 -> {
                     val sport = b.getShort(h).toInt() and 0xFFFF
@@ -174,6 +188,18 @@ class UsbMuxTest {
         val ld = LockdownClient(conn)
         assertEquals("com.apple.mobile.lockdown", ld.queryType())
         assertTrue(dev.hostSeqSeen >= 2)
+    }
+
+    @Test fun packetRightAfterVersionUsesV2Header() {
+        val logs = ArrayList<String>()
+        val dev = FakeDevice().apply { burstAfterVersion = true }
+        val mux = UsbMux({ dev.fromHost(it) }, { synchronized(logs) { logs += it } })
+        dev.mux = mux
+        assertEquals(2, mux.handshake(1000))
+        // v1 ヘッダとして誤解釈すると 0xFACE(64206) 宛と判定される
+        assertTrue(synchronized(logs) { logs.none { it.contains("64206") } })
+        assertTrue(synchronized(logs) { logs.any { it.contains("unknown port 9") } })
+        assertEquals("com.apple.mobile.lockdown", LockdownClient(mux.connect(62078, 1000)).queryType())
     }
 
     @Test(expected = java.io.IOException::class)

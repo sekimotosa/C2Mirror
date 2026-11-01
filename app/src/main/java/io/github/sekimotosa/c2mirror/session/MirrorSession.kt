@@ -34,6 +34,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 enum class Phase {
     IDLE,
     WAITING_PERMISSION,
+    PAIRING,
     ACTIVATING,
     WAITING_REENUMERATION,
     CONNECTING,
@@ -119,6 +120,8 @@ class MirrorSession(
     /** ペアリング完了後も映像が始まらない場合の自動再接続（1 回のみ） */
     private var restartAfterPairing = 0
     private var forceAutoStartOnce = false
+    /** QuickTime 構成の有効化前に、usbmux 構成で信頼（ペアリング）を済ませたか */
+    private var preflightDone = false
     private var reenumDeadline = 0L
     private var activationAttempts = 0
     private var muxConfigId: Int? = null
@@ -272,6 +275,7 @@ class MirrorSession(
         if (!usb.isUsbHostSupported) { fail(ErrorKind.NO_USB_HOST, "この端末は USB Host に対応していません。"); return }
         diagnostics.resetSession()
         activationAttempts = 0
+        preflightDone = false
         target = device
         update { it.copy(error = null) }
         withPermission(device) { proceed(device) }
@@ -321,6 +325,7 @@ class MirrorSession(
             fail(ErrorKind.NO_DEVICE, "接続された Apple 機器に usbmux 構成が見つかりません（iPhone/iPad ではない可能性）。")
             return
         }
+        if (!preflightDone) { startPreflight(device, snap); return }
         update { it.copy(phase = Phase.ACTIVATING) }
         activationAttempts++
         val conn = usb.usbManager.openDevice(device)
@@ -335,6 +340,102 @@ class MirrorSession(
         reenumDeadline = SystemClock.uptimeMillis() + REENUM_TIMEOUT_MS
         val token = sessionToken
         pollReenumeration(token)
+    }
+
+    /**
+     * macOS / Linux と同じ順序にする: まず usbmux 構成で lockdown に接続して信頼（ペアリング）とセッションを確立し、
+     * その後で QuickTime 構成を有効化する。実機検証で、usbmux 構成から切り替えた場合にのみ PING を受信できたため。
+     */
+    private fun startPreflight(device: UsbDevice, snap: UsbDeviceSnapshot) {
+        val muxCfg = AppleUsb.findMuxConfig(snap)
+        val muxIf = muxCfg?.let { AppleUsb.findInterface(it, AppleUsb.SUBCLASS_USBMUX) }
+        val conn = usb.usbManager.openDevice(device)
+        if (conn == null) { fail(ErrorKind.OPEN_FAILED, "USB デバイスを開けませんでした。"); return }
+        if (muxCfg == null || muxIf == null) {
+            conn.close(); preflightDone = true; activate(device, snap); return
+        }
+        update { it.copy(phase = Phase.PAIRING) }
+        connection = conn
+        val active = readActiveConfiguration(conn)
+        val setOk = if (active != muxCfg.id) device.findConfiguration(muxCfg.id)?.let { runCatching { conn.setConfiguration(it) }.getOrDefault(false) } else true
+        diagnostics.log("preflight: usbmux configuration before=${active ?: "?"} mux=#${muxCfg.id} set=$setOk after=${readActiveConfiguration(conn) ?: "?"}")
+        val iface = device.findConfiguration(muxCfg.id)?.findInterface(muxIf.id, muxIf.alternateSetting)
+        val token = sessionToken
+        val ok = iface != null && startMux(conn, iface) { st, detail -> ctl.post { onPreflightState(token, device, st, detail) } }
+        if (!ok) {
+            diagnostics.log("preflight: usbmux unavailable; activating QuickTime directly")
+            finishPreflight(device)
+        }
+    }
+
+    private fun onPreflightState(token: Int, device: UsbDevice, st: PairingAgent.State, detail: String?) {
+        if (token != sessionToken || state.phase != Phase.PAIRING) return
+        recordPairingState(st, detail)
+        when (st) {
+            PairingAgent.State.DENIED -> {
+                teardown(graceful = false, restoreUsbmux = false)
+                fail(ErrorKind.PAIRING_FAILED, "iPhone で「信頼しない」が選択されました。ケーブルを抜き差しして、「信頼」をタップしてください。")
+            }
+            // 成功・失敗いずれでも QuickTime 構成の有効化へ進む（失敗時は診断に記録）
+            PairingAgent.State.SESSION_OK, PairingAgent.State.FAILED -> finishPreflight(device)
+            else -> Unit
+        }
+    }
+
+    private fun finishPreflight(device: UsbDevice) {
+        stopMux()
+        connection?.close()
+        connection = null
+        preflightDone = true
+        val d = usb.findDevice(device.deviceName) ?: device
+        activate(d, d.snapshot())
+    }
+
+    /** usbmux インターフェースを確保して PairingAgent を開始する */
+    private fun startMux(conn: UsbDeviceConnection, iface: android.hardware.usb.UsbInterface,
+                         onState: (PairingAgent.State, String?) -> Unit): Boolean {
+        val inEp = UsbTransport.findBulk(iface, true)
+        val outEp = UsbTransport.findBulk(iface, false)
+        if (inEp == null || outEp == null) return false
+        val link = MuxUsbLink(conn, iface, inEp, outEp)
+        if (!link.claim()) {
+            diagnostics.log("pairing: claim usbmux interface #${iface.id} failed")
+            return false
+        }
+        val m = UsbMux({ link.write(it) }, { diagnostics.log(it) })
+        muxLink = link
+        mux = m
+        link.start({ b, o, l -> m.onUsbData(b, o, l) }, { e -> diagnostics.log("usbmux rx error: ${e.message}") })
+        val token = sessionToken
+        val agent = PairingAgent(
+            mux = m,
+            identity = hostIdentity,
+            log = { diagnostics.log(it) },
+            onState = onState,
+            isCancelled = { token != sessionToken },
+        )
+        pairingState = PairingAgent.State.CONNECTING
+        pairingThread = Thread({ agent.run() }, "c2m-pairing").apply { start() }
+        return true
+    }
+
+    private fun stopMux() {
+        stopMux()
+    }
+
+    private fun recordPairingState(st: PairingAgent.State, detail: String?) {
+        pairingState = st
+        diagnostics.pairing = when (st) {
+            PairingAgent.State.CONNECTING -> "lockdown 接続中"
+            PairingAgent.State.WAITING_USER_TRUST -> "iPhone の「信頼」待ち"
+            PairingAgent.State.LOCKED -> "iPhone がロック中（パスコードで解除が必要）"
+            PairingAgent.State.PAIRED -> "ペアリング成功"
+            PairingAgent.State.SESSION_OK -> "信頼済み・セッション確立（iOS ${detail ?: "?"}）"
+            PairingAgent.State.DENIED -> "iPhone で「信頼しない」が選択された"
+            PairingAgent.State.FAILED -> "失敗: ${detail ?: "?"}"
+        }
+        diagnostics.log("pairing: ${diagnostics.pairing}")
+        update { it.copy(pairing = st) }
     }
 
     private fun pollReenumeration(token: Int) {
@@ -381,6 +482,13 @@ class MirrorSession(
         val active = readActiveConfiguration(conn)
         var setResult = "skip"
         if (active != qtInfo.id) {
+            // usbmux 構成を経由してから QuickTime 構成へ（PING を受信できた唯一のケースと同じ遷移）
+            val muxCfg = muxConfigId?.let { device.findConfiguration(it) }
+            if (muxCfg != null && active != muxCfg.id) {
+                val r = runCatching { conn.setConfiguration(muxCfg) }.getOrDefault(false)
+                diagnostics.log("configuration: via usbmux #${muxCfg.id} set=$r")
+                SystemClock.sleep(VIA_MUX_DELAY_MS)
+            }
             val cfg = device.findConfiguration(qtInfo.id)
             setResult = if (cfg != null) runCatching { conn.setConfiguration(cfg) }.getOrDefault(false).toString() else "config not found"
         }
@@ -416,47 +524,14 @@ class MirrorSession(
         val token = sessionToken
         val muxInfo = AppleUsb.findInterface(qtInfo, AppleUsb.SUBCLASS_USBMUX)
         val iface = muxInfo?.let { device.findConfiguration(qtInfo.id)?.findInterface(it.id, it.alternateSetting) }
-        val inEp = iface?.let { UsbTransport.findBulk(it, true) }
-        val outEp = iface?.let { UsbTransport.findBulk(it, false) }
-        if (iface == null || inEp == null || outEp == null) {
-            diagnostics.pairing = "usbmux インターフェースなし"
-            return
+        if (iface == null || !startMux(conn, iface) { st, detail -> ctl.post { onPairingState(token, st, detail) } }) {
+            diagnostics.pairing = "usbmux インターフェースを使用できません"
         }
-        val link = MuxUsbLink(conn, iface, inEp, outEp)
-        if (!link.claim()) {
-            diagnostics.pairing = "usbmux インターフェースの確保に失敗"
-            diagnostics.log("pairing: claim usbmux interface #${iface.id} failed")
-            return
-        }
-        val m = UsbMux({ link.write(it) }, { diagnostics.log(it) })
-        muxLink = link
-        mux = m
-        link.start({ b, o, l -> m.onUsbData(b, o, l) }, { e -> diagnostics.log("usbmux rx error: ${e.message}") })
-        val agent = PairingAgent(
-            mux = m,
-            identity = hostIdentity,
-            log = { diagnostics.log(it) },
-            onState = { st, detail -> ctl.post { onPairingState(token, st, detail) } },
-            isCancelled = { token != sessionToken },
-        )
-        pairingState = PairingAgent.State.CONNECTING
-        pairingThread = Thread({ agent.run() }, "c2m-pairing").apply { start() }
     }
 
     private fun onPairingState(token: Int, st: PairingAgent.State, detail: String?) {
         if (token != sessionToken) return
-        pairingState = st
-        diagnostics.pairing = when (st) {
-            PairingAgent.State.CONNECTING -> "lockdown 接続中"
-            PairingAgent.State.WAITING_USER_TRUST -> "iPhone の「信頼」待ち"
-            PairingAgent.State.LOCKED -> "iPhone がロック中（パスコードで解除が必要）"
-            PairingAgent.State.PAIRED -> "ペアリング成功"
-            PairingAgent.State.SESSION_OK -> "信頼済み・セッション確立（iOS ${detail ?: "?"}）"
-            PairingAgent.State.DENIED -> "iPhone で「信頼しない」が選択された"
-            PairingAgent.State.FAILED -> "失敗: ${detail ?: "?"}"
-        }
-        diagnostics.log("pairing: ${diagnostics.pairing}")
-        update { it.copy(pairing = st) }
+        recordPairingState(st, detail)
         when (st) {
             PairingAgent.State.DENIED -> {
                 teardown(graceful = false, restoreUsbmux = true)
@@ -642,13 +717,7 @@ class MirrorSession(
         t?.stop()
         reader?.join(1500)
         reader = null
-        mux?.closeAll()
-        mux = null
-        muxLink?.close()
-        muxLink = null
-        pairingThread?.join(1000)
-        pairingThread = null
-        pairingState = null
+        stopMux()
         t?.close()
         transport = null
         protocol = null
@@ -735,6 +804,7 @@ class MirrorSession(
         const val STREAM_START_TIMEOUT_MS = 15000L
         const val PAIRING_WAIT_MAX_MS = 120_000L
         const val RESTART_AFTER_PAIRING_MS = 5000L
+        const val VIA_MUX_DELAY_MS = 300L
         const val CLOSE_TIMEOUT_MS = 3000L
         const val REPLUG_DEBOUNCE_MS = 4000L
     }
