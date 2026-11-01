@@ -65,24 +65,63 @@ class UsbTransport(
         }
     }
 
+    /** 実際に使われている受信方式（診断表示用） */
+    @Volatile var rxMode: String = "-"; private set
+
     /**
      * 受信ループ（呼び出しスレッドをブロックする）。[stop] が呼ばれるか USB エラーで終了。
      * [onData] には受信したバイト列を渡す（呼び出し中のみ有効）。
+     *
+     * 端末の USB スタックによっては非同期要求（UsbRequest）が使えない／大きなバッファを受け付けないため、
+     * 次の順にフォールバックする: UsbRequest 64KiB×8 → 16KiB×8 → 16KiB×1 → 同期 bulkTransfer。
      */
-    fun readLoop(onData: (ByteArray, Int, Int) -> Unit) {
+    fun readLoop(
+        isDevicePresent: () -> Boolean,
+        log: (String) -> Unit,
+        onData: (ByteArray, Int, Int) -> Unit,
+    ) {
         running.set(true)
-        val size = if (Build.VERSION.SDK_INT >= 28) 64 * 1024 else 16 * 1024 // API 27 以前は 16KB 上限
-        val requests = ArrayList<UsbRequest>(IN_FLIGHT)
+        try {
+            val attempts = buildList {
+                if (Build.VERSION.SDK_INT >= 28) add(64 * 1024 to IN_FLIGHT) // API 27 以前は 16KiB 上限
+                add(16 * 1024 to IN_FLIGHT)
+                add(16 * 1024 to 1)
+            }
+            val failed = ArrayList<String>()
+            for ((size, inFlight) in attempts) {
+                if (!running.get()) return
+                val label = "UsbRequest ${size / 1024}KiB×$inFlight"
+                when (val r = runAsync(size, inFlight, label, log, onData)) {
+                    null -> return // 正常終了（stop）
+                    else -> { failed += "$label: $r"; log("rx: $label unavailable ($r)") }
+                }
+            }
+            rxMode = "bulkTransfer ${SYNC_READ_SIZE / 1024}KiB (同期)"
+            log("rx mode: $rxMode; async failed: ${failed.joinToString()}")
+            runSync(isDevicePresent, onData)
+        } finally {
+            running.set(false)
+        }
+    }
+
+    /**
+     * 非同期受信。初回のキューイングに失敗した場合は後片付けして失敗理由を返す（フォールバック用）。
+     * 受信開始後のエラーは例外を投げる。stop で終了した場合は null。
+     */
+    private fun runAsync(size: Int, inFlight: Int, label: String, log: (String) -> Unit, onData: (ByteArray, Int, Int) -> Unit): String? {
+        val requests = ArrayList<UsbRequest>(inFlight)
         val tmp = ByteArray(size)
         try {
-            repeat(IN_FLIGHT) {
+            for (i in 0 until inFlight) {
                 val r = UsbRequest()
-                if (!r.initialize(connection, inEndpoint)) throw IOException("UsbRequest.initialize failed")
+                if (!r.initialize(connection, inEndpoint)) { r.close(); return "initialize failed" }
                 val b = ByteBuffer.allocateDirect(size)
                 r.clientData = b
                 requests += r
-                if (!r.queue(b)) throw IOException("UsbRequest.queue failed")
+                if (!r.queue(b)) return "queue failed (#${i + 1})"
             }
+            rxMode = label
+            log("rx mode: $label")
             while (running.get()) {
                 val r = try {
                     connection.requestWait(READ_POLL_MS)
@@ -94,16 +133,38 @@ class UsbTransport(
                 b.flip()
                 b.get(tmp, 0, n)
                 b.clear()
-                if (running.get() && !r.queue(b)) throw IOException("UsbRequest.queue failed (device disconnected?)")
+                if (running.get() && !r.queue(b)) throw IOException("UsbRequest.queue failed while streaming (device disconnected?)")
                 if (n > 0) {
                     bytesRead += n
                     onData(tmp, 0, n)
                 }
             }
+            return null
         } finally {
-            running.set(false)
             for (r in requests) { runCatching { r.cancel() } }
             for (r in requests) { runCatching { r.close() } }
+        }
+    }
+
+    /**
+     * 同期 bulkTransfer による受信（最も互換性が高い）。
+     * bulkTransfer はタイムアウトとエラーを区別できないため、失敗時はデバイスの存在で判定する。
+     */
+    private fun runSync(isDevicePresent: () -> Boolean, onData: (ByteArray, Int, Int) -> Unit) {
+        val buf = ByteArray(SYNC_READ_SIZE)
+        var failures = 0
+        while (running.get()) {
+            val n = connection.bulkTransfer(inEndpoint, buf, buf.size, SYNC_READ_TIMEOUT_MS)
+            if (n > 0) {
+                failures = 0
+                bytesRead += n
+                onData(buf, 0, n)
+            } else if (n < 0) {
+                if (!running.get()) break
+                failures++
+                // タイムアウト（データ無し）か切断か: 数回連続したらデバイスの存在を確認
+                if (failures >= 3 && !isDevicePresent()) throw IOException("bulkTransfer failed (device disconnected)")
+            }
         }
     }
 
@@ -120,6 +181,8 @@ class UsbTransport(
         const val READ_POLL_MS = 250L
         const val WRITE_TIMEOUT_MS = 1000
         const val MAX_SYNC_TRANSFER = 16 * 1024
+        const val SYNC_READ_SIZE = 16 * 1024
+        const val SYNC_READ_TIMEOUT_MS = 500
 
         fun findBulk(iface: UsbInterface, dirIn: Boolean): UsbEndpoint? =
             (0 until iface.endpointCount).map { iface.getEndpoint(it) }.firstOrNull {

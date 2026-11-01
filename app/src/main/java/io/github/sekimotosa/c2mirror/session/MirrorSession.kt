@@ -424,12 +424,16 @@ class MirrorSession(
                 diagnostics.log("packet error: ${e.message}")
             }
         }
+        val devName = target?.deviceName
         reader = Thread({
             runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY) }
                 .onFailure { runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY) } }
             var err: Throwable? = null
             try {
-                t.readLoop { b, o, l -> framer.feed(b, o, l) }
+                t.readLoop(
+                    isDevicePresent = { devName != null && usb.findDevice(devName) != null },
+                    log = { diagnostics.log(it) },
+                ) { b, o, l -> framer.feed(b, o, l) }
             } catch (e: Throwable) {
                 err = e
             }
@@ -527,7 +531,7 @@ class MirrorSession(
             diagnostics.log("closeSession released=$ok")
         }
         t?.stop()
-        reader?.join(1000)
+        reader?.join(1500)
         reader = null
         t?.close()
         transport = null
@@ -580,7 +584,7 @@ class MirrorSession(
             append("FEED=${p?.videoSamples ?: 0} EAT=${p?.audioSamples ?: 0} feedErr=${p?.feedParseErrors ?: 0} unknown=${p?.unknownPackets ?: 0}")
             append(" queued=${d?.framesQueued ?: 0} rendered=${d?.framesRendered ?: 0} dropped=${d?.framesDropped ?: 0}")
             append(" backlogFlush=${d?.backlogFlushes ?: 0} decodeLatency=%.1fms".format(d?.decodeLatencyMs ?: 0.0))
-            append(" rx=${(t?.bytesRead ?: 0) / 1024}KiB tx=${(t?.bytesWritten ?: 0) / 1024}KiB")
+            append(" rx=${(t?.bytesRead ?: 0) / 1024}KiB tx=${(t?.bytesWritten ?: 0) / 1024}KiB rxMode=${t?.rxMode ?: "-"}")
             d?.lastError?.let { append(" decoderLastError=$it") }
         }
     }
