@@ -17,6 +17,12 @@ class C2MirrorApp : Application() {
         super.onCreate()
         usb = UsbDeviceManager(this).also { it.start() }
         val diag = Diagnostics("C2Mirror ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) ${BuildConfig.BUILD_TYPE}")
+        diag.attachStorage(filesDir)
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            runCatching { diag.recordCrash(t, e) }
+            previous?.uncaughtException(t, e)
+        }
         session = MirrorSession(usb, diag, ::hostIdentity)
         session.setAutoStart(getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_AUTO, true))
     }

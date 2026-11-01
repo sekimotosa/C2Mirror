@@ -60,7 +60,7 @@ class PairingAgent(
                     ld.close()
                 }
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             if (!isCancelled()) {
                 log("pairing failed: ${e.javaClass.simpleName}: ${e.message}")
                 onState(State.FAILED, e.message)

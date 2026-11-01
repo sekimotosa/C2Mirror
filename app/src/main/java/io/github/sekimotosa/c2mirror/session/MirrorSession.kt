@@ -58,6 +58,7 @@ enum class ErrorKind {
     PROTOCOL_ERROR,
     DECODER_ERROR,
     PAIRING_FAILED,
+    INTERNAL_ERROR,
 }
 
 data class SessionError(val kind: ErrorKind, val detail: String)
@@ -100,7 +101,21 @@ class MirrorSession(
 
     private val main = Handler(Looper.getMainLooper())
     private val ctlThread = HandlerThread("c2m-session").apply { start() }
-    private val ctl = Handler(ctlThread.looper)
+    /** 制御スレッドで例外が起きてもアプリを落とさず、診断に記録してセッションを終了する */
+    private val ctl = object : Handler(ctlThread.looper) {
+        override fun dispatchMessage(msg: android.os.Message) {
+            try {
+                super.dispatchMessage(msg)
+            } catch (e: Throwable) {
+                diagnostics.error("internal error: ${diagnostics.exceptionText(e)}")
+                runCatching {
+                    if (state.phase != Phase.IDLE) teardown(graceful = false, restoreUsbmux = false)
+                    update { it.copy(phase = Phase.IDLE, error = SessionError(ErrorKind.INTERNAL_ERROR, "${e.javaClass.simpleName}: ${e.message}"),
+                        suppressedUntilReplug = true) }
+                }
+            }
+        }
+    }
     private val observers = CopyOnWriteArrayList<StateObserver>()
 
     @Volatile var state = UiState(usbHostSupported = usb.isUsbHostSupported); private set
@@ -133,6 +148,10 @@ class MirrorSession(
         diagnostics.usbHostSupported = usb.isUsbHostSupported
         diagnostics.stats = { statsLine() }
         usb.addListener(this)
+        diagnostics.previousCrash?.let { c ->
+            state = state.copy(error = SessionError(ErrorKind.INTERNAL_ERROR,
+                "前回アプリが異常終了しました（${c.lineSequence().drop(1).firstOrNull()?.take(120) ?: ""}）。診断情報に詳細があります。"))
+        }
         ctl.post { refreshDevice(); scheduleScan() }
     }
 
@@ -357,10 +376,12 @@ class MirrorSession(
         update { it.copy(phase = Phase.PAIRING) }
         connection = conn
         val active = readActiveConfiguration(conn)
+        diagnostics.log("step: preflight setConfiguration #${muxCfg.id} (active=${active ?: "?"})")
         val setOk = if (active != muxCfg.id) device.findConfiguration(muxCfg.id)?.let { runCatching { conn.setConfiguration(it) }.getOrDefault(false) } else true
         diagnostics.log("preflight: usbmux configuration before=${active ?: "?"} mux=#${muxCfg.id} set=$setOk after=${readActiveConfiguration(conn) ?: "?"}")
         val iface = device.findConfiguration(muxCfg.id)?.findInterface(muxIf.id, muxIf.alternateSetting)
         val token = sessionToken
+        diagnostics.log("step: preflight claim usbmux interface")
         val ok = iface != null && startMux(conn, iface) { st, detail -> ctl.post { onPreflightState(token, device, st, detail) } }
         if (!ok) {
             diagnostics.log("preflight: usbmux unavailable; activating QuickTime directly")
@@ -383,6 +404,7 @@ class MirrorSession(
     }
 
     private fun finishPreflight(device: UsbDevice) {
+        diagnostics.log("step: preflight finished; releasing usbmux")
         stopMux()
         connection?.close()
         connection = null
@@ -419,8 +441,18 @@ class MirrorSession(
         return true
     }
 
+    /** usbmux とペアリングスレッドを停止する。ペアリングスレッドが USB を使い終わるまで待ってから戻る。 */
     private fun stopMux() {
-        stopMux()
+        mux?.closeAll()
+        mux = null
+        muxLink?.close()
+        muxLink = null
+        pairingThread?.let { th ->
+            th.join(3000)
+            if (th.isAlive) { diagnostics.log("pairing thread still running; interrupting"); th.interrupt(); th.join(2000) }
+        }
+        pairingThread = null
+        pairingState = null
     }
 
     private fun recordPairingState(st: PairingAgent.State, detail: String?) {
@@ -485,10 +517,12 @@ class MirrorSession(
             // usbmux 構成を経由してから QuickTime 構成へ（PING を受信できた唯一のケースと同じ遷移）
             val muxCfg = muxConfigId?.let { device.findConfiguration(it) }
             if (muxCfg != null && active != muxCfg.id) {
+                diagnostics.log("step: setConfiguration via usbmux #${muxCfg.id}")
                 val r = runCatching { conn.setConfiguration(muxCfg) }.getOrDefault(false)
                 diagnostics.log("configuration: via usbmux #${muxCfg.id} set=$r")
                 SystemClock.sleep(VIA_MUX_DELAY_MS)
             }
+            diagnostics.log("step: setConfiguration QuickTime #${qtInfo.id}")
             val cfg = device.findConfiguration(qtInfo.id)
             setResult = if (cfg != null) runCatching { conn.setConfiguration(cfg) }.getOrDefault(false).toString() else "config not found"
         }
@@ -504,6 +538,7 @@ class MirrorSession(
             return
         }
         val t = UsbTransport(conn, iface, inEp, outEp)
+        diagnostics.log("step: claim AV interface #${iface.id}")
         val claim = t.claim()
         diagnostics.interfaceClaim = "Interface #${iface.id}: ${claim.detail} IN=0x%02x OUT=0x%02x".format(inEp.address, outEp.address)
         diagnostics.log("claim: ${diagnostics.interfaceClaim}")

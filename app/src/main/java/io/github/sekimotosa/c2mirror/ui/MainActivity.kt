@@ -188,6 +188,7 @@ class MainActivity : Activity(), MirrorSession.StateObserver {
         ErrorKind.PROTOCOL_ERROR -> "プロトコルエラー"
         ErrorKind.DECODER_ERROR -> "映像デコードエラー"
         ErrorKind.PAIRING_FAILED -> "iPhone の信頼（ペアリング）に失敗"
+        ErrorKind.INTERNAL_ERROR -> "アプリ内部エラー"
     }
 
     private fun showOverlayTemporarily() {

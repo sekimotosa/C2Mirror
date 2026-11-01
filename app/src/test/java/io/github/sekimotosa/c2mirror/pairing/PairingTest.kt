@@ -151,12 +151,44 @@ class UsbMuxTest {
                         if (all.size >= 4 && all.size >= 4 + ByteBuffer.wrap(all).int) {
                             lockdownIn.reset()
                             val req = Plist.decodeDict(all.copyOfRange(4, all.size))
-                            val resp = Plist.encode(mapOf("Request" to req["Request"]!!, "Type" to "com.apple.mobile.lockdown"))
+                            val resp = Plist.encode(lockdown(req))
                             tcp(dport, sport, deviceSeq + 1, seq + payload.size, UsbMux.TH_ACK,
                                 ByteBuffer.allocate(4).putInt(resp.size).array() + resp)
                         }
                     }
                 }
+            }
+        }
+
+        // 擬似 lockdownd: 未ペア → Pair（1 回目は信頼待ち）→ StartSession 成功
+        var paired = false
+        var pairAttempts = 0
+        val devKeys by lazy { Certificates.generateRsaKeyPair() }
+        val requests = ArrayList<String>()
+        fun lockdown(req: Map<String, Any>): Map<String, Any> {
+            val r = req["Request"] as String
+            synchronized(requests) { requests += r }
+            return when (r) {
+                "QueryType" -> mapOf("Request" to r, "Type" to "com.apple.mobile.lockdown")
+                "StartSession" -> if (paired) mapOf("Request" to r, "SessionID" to "S1", "EnableSessionSSL" to false)
+                    else mapOf("Request" to r, "Error" to "InvalidHostID")
+                "GetValue" -> when (req["Key"]) {
+                    "DevicePublicKey" -> {
+                        val spki = devKeys.public.encoded
+                        mapOf("Request" to r, "Value" to Certificates.pem("PUBLIC KEY", spki))
+                    }
+                    "ProductVersion" -> mapOf("Request" to r, "Value" to "18.1")
+                    else -> mapOf("Request" to r, "Value" to "iPhone")
+                }
+                "Pair" -> {
+                    pairAttempts++
+                    @Suppress("UNCHECKED_CAST")
+                    val rec = req["PairRecord"] as Map<String, Any>
+                    check(rec.keys.containsAll(listOf("DeviceCertificate", "HostCertificate", "RootCertificate", "HostID", "SystemBUID")))
+                    if (pairAttempts == 1) mapOf("Request" to r, "Error" to "PairingDialogResponsePending")
+                    else { paired = true; mapOf("Request" to r, "EscrowBag" to byteArrayOf(1, 2, 3)) }
+                }
+                else -> mapOf("Request" to r)
             }
         }
 
@@ -200,6 +232,21 @@ class UsbMuxTest {
         assertTrue(synchronized(logs) { logs.none { it.contains("64206") } })
         assertTrue(synchronized(logs) { logs.any { it.contains("unknown port 9") } })
         assertEquals("com.apple.mobile.lockdown", LockdownClient(mux.connect(62078, 1000)).queryType())
+    }
+
+    @Test fun pairingAgentPairsThenStartsSession() {
+        val dev = FakeDevice()
+        val mux = UsbMux({ dev.fromHost(it) })
+        dev.mux = mux
+        val states = ArrayList<PairingAgent.State>()
+        val id = HostIdentity.generate()
+        val agent = PairingAgent(mux, { id }, { }, { st, _ -> synchronized(states) { states += st } }, { false })
+        val t = Thread { agent.run() }
+        t.start(); t.join(20000)
+        assertEquals(listOf(PairingAgent.State.CONNECTING, PairingAgent.State.WAITING_USER_TRUST,
+            PairingAgent.State.PAIRED, PairingAgent.State.SESSION_OK), states)
+        assertEquals("18.1", agent.productVersion)
+        assertEquals(2, dev.pairAttempts)
     }
 
     @Test(expected = java.io.IOException::class)

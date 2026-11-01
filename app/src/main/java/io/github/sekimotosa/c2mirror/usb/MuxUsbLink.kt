@@ -22,8 +22,12 @@ class MuxUsbLink(
 
     fun claim(): Boolean = connection.claimInterface(iface, true)
 
+    @Volatile private var closed = false
+
     fun write(data: ByteArray) {
+        if (closed) throw IOException("usbmux link closed")
         synchronized(writeLock) {
+            if (closed) throw IOException("usbmux link closed")
             var off = 0
             while (off < data.size) {
                 val n = connection.bulkTransfer(outEp, data, off, minOf(16384, data.size - off), 1000)
@@ -56,6 +60,7 @@ class MuxUsbLink(
         running.set(false)
         thread?.join(1000)
         thread = null
+        synchronized(writeLock) { closed = true } // 書き込み中なら完了を待つ
         runCatching { connection.releaseInterface(iface) }
     }
 }

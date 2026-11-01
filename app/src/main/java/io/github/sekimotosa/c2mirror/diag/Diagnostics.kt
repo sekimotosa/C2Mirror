@@ -1,6 +1,10 @@
 package io.github.sekimotosa.c2mirror.diag
 
 import android.os.Build
+import java.io.File
+import java.io.FileOutputStream
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -33,11 +37,53 @@ class Diagnostics(private val appVersion: String) {
     var lastError: String? = null
     var stats: () -> String = { "" }
 
+    /** 前回の実行で異常終了した場合のスタックトレース（次回起動時に表示） */
+    var previousCrash: String? = null; private set
+    /** 前回の実行ログの末尾（ネイティブクラッシュなどでプロセスが落ちても残るようファイルに逐次書き出す） */
+    var previousRunLog: String? = null; private set
+    private var logOut: FileOutputStream? = null
+    private var crashFile: File? = null
+
+    /** アプリ専用領域にログを保存する。前回分は previous として読み込む（端末外へは送らない）。 */
+    fun attachStorage(dir: File) {
+        synchronized(lock) {
+            val cur = File(dir, "diag-current.log")
+            val prev = File(dir, "diag-previous.log")
+            crashFile = File(dir, "last-crash.txt")
+            if (cur.exists()) {
+                prev.delete(); cur.renameTo(prev)
+            }
+            previousRunLog = runCatching { prev.readLines().takeLast(PREVIOUS_LINES).joinToString("\n") }.getOrNull()
+            previousCrash = crashFile?.takeIf { it.exists() }?.let { f -> runCatching { f.readText() }.getOrNull().also { f.delete() } }
+            logOut = runCatching { FileOutputStream(cur, false) }.getOrNull()
+            log.forEach { writeLine(it) }
+        }
+    }
+
+    private fun writeLine(line: String) {
+        runCatching { logOut?.apply { write((line + "\n").toByteArray()); flush() } }
+    }
+
+    /** 未捕捉例外の記録（プロセス終了直前に呼ばれる） */
+    fun recordCrash(thread: Thread, e: Throwable) {
+        val sw = StringWriter()
+        e.printStackTrace(PrintWriter(sw))
+        log("CRASH in thread ${thread.name}: $e")
+        runCatching { crashFile?.writeText("thread: ${thread.name}\n$sw") }
+    }
+
+    fun exceptionText(e: Throwable): String {
+        val sw = StringWriter()
+        e.printStackTrace(PrintWriter(sw))
+        return sw.toString().lines().take(25).joinToString("\n")
+    }
+
     fun log(msg: String) {
         val line = "+%6.1fs %s".format((System.currentTimeMillis() - start) / 1000.0, msg)
         synchronized(lock) {
             log.addLast(line)
             while (log.size > MAX_LOG) log.removeFirst()
+            writeLine(line)
         }
         android.util.Log.i("C2M", msg)
     }
@@ -89,9 +135,22 @@ class Diagnostics(private val appVersion: String) {
         appendLine()
         appendLine("[ログ]")
         synchronized(lock) { log.forEach { appendLine(it) } }
+        previousCrash?.let {
+            appendLine()
+            appendLine("[前回の実行での異常終了]")
+            appendLine(it.lines().take(40).joinToString("\n"))
+        }
+        previousRunLog?.takeIf { it.isNotBlank() }?.let {
+            appendLine()
+            appendLine("[前回の実行ログ（末尾）]")
+            appendLine(it)
+        }
     }
 
     private fun Boolean?.fmt() = when (this) { true -> "対応"; false -> "非対応"; null -> "-" }
 
-    companion object { const val MAX_LOG = 300 }
+    companion object {
+        const val MAX_LOG = 300
+        const val PREVIOUS_LINES = 120
+    }
 }
