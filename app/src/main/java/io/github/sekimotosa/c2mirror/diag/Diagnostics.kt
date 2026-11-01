@@ -22,6 +22,7 @@ class Diagnostics(private val appVersion: String) {
     var reenumeration: String? = null
     var activeConfiguration: String? = null
     var interfaceClaim: String? = null
+    var pairing: String? = null
     var sessionState: String? = null
     var pingReceived = false
     var clockNegotiation: String? = null
@@ -68,6 +69,7 @@ class Diagnostics(private val appVersion: String) {
         appendLine("再認識: ${reenumeration ?: "-"}")
         appendLine("アクティブ構成: ${activeConfiguration ?: "-"}")
         appendLine("インターフェース Claim: ${interfaceClaim ?: "-"}")
+        appendLine("ペアリング（信頼）: ${pairing ?: "-"}")
         appendLine()
         appendLine("[Descriptor]")
         appendLine(deviceDescription ?: "(なし)")

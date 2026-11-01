@@ -22,6 +22,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.github.sekimotosa.c2mirror.C2MirrorApp
 import io.github.sekimotosa.c2mirror.R
+import io.github.sekimotosa.c2mirror.pairing.PairingAgent
 import io.github.sekimotosa.c2mirror.session.ErrorKind
 import io.github.sekimotosa.c2mirror.session.MirrorSession
 import io.github.sekimotosa.c2mirror.session.Phase
@@ -158,10 +159,18 @@ class MainActivity : Activity(), MirrorSession.StateObserver {
         Phase.ACTIVATING -> "iPhone の画面転送モードを有効化中…"
         Phase.WAITING_REENUMERATION -> "iPhone の再接続を待っています…"
         Phase.CONNECTING -> "USB 接続を確立中…"
-        Phase.WAITING_PING -> "iPhone の応答を待っています…"
-        Phase.NEGOTIATING -> "映像ストリームを開始しています…"
+        Phase.WAITING_PING, Phase.NEGOTIATING -> pairingText(s) ?: if (s.phase == Phase.WAITING_PING)
+            "iPhone の応答を待っています…" else "映像ストリームを開始しています…"
         Phase.STREAMING -> "ミラーリング中"
         Phase.STOPPING -> "切断中…"
+    }
+
+    private fun pairingText(s: UiState): String? = when (s.pairing) {
+        PairingAgent.State.WAITING_USER_TRUST -> "iPhone に表示された「このコンピュータを信頼しますか？」で「信頼」をタップし、パスコードを入力してください"
+        PairingAgent.State.LOCKED -> "iPhone のロックを解除してください（信頼の確認に必要です）"
+        PairingAgent.State.CONNECTING -> "iPhone と接続を確認しています…"
+        PairingAgent.State.PAIRED -> "信頼されました。映像ストリームを開始しています…"
+        else -> null
     }
 
     private fun errorTitle(k: ErrorKind) = when (k) {
@@ -177,6 +186,7 @@ class MainActivity : Activity(), MirrorSession.StateObserver {
         ErrorKind.USB_IO_ERROR -> "USB 通信エラー"
         ErrorKind.PROTOCOL_ERROR -> "プロトコルエラー"
         ErrorKind.DECODER_ERROR -> "映像デコードエラー"
+        ErrorKind.PAIRING_FAILED -> "iPhone の信頼（ペアリング）に失敗"
     }
 
     private fun showOverlayTemporarily() {

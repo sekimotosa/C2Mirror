@@ -15,7 +15,11 @@ import io.github.sekimotosa.c2mirror.protocol.ProtocolEvent
 import io.github.sekimotosa.c2mirror.protocol.ProtocolException
 import io.github.sekimotosa.c2mirror.protocol.ProtocolListener
 import io.github.sekimotosa.c2mirror.protocol.QuickTimeProtocol
+import io.github.sekimotosa.c2mirror.pairing.HostIdentity
+import io.github.sekimotosa.c2mirror.pairing.PairingAgent
+import io.github.sekimotosa.c2mirror.pairing.UsbMux
 import io.github.sekimotosa.c2mirror.usb.AppleUsb
+import io.github.sekimotosa.c2mirror.usb.MuxUsbLink
 import io.github.sekimotosa.c2mirror.usb.UsbDeviceManager
 import io.github.sekimotosa.c2mirror.usb.UsbDeviceSnapshot
 import io.github.sekimotosa.c2mirror.usb.UsbTransport
@@ -52,6 +56,7 @@ enum class ErrorKind {
     USB_IO_ERROR,
     PROTOCOL_ERROR,
     DECODER_ERROR,
+    PAIRING_FAILED,
 }
 
 data class SessionError(val kind: ErrorKind, val detail: String)
@@ -67,6 +72,8 @@ data class UiState(
     val videoHeight: Int = 0,
     val autoStart: Boolean = true,
     val suppressedUntilReplug: Boolean = false,
+    /** ペアリング（信頼）の状況。iPhone 側の操作が必要な場合の案内に使う */
+    val pairing: PairingAgent.State? = null,
 )
 
 /**
@@ -84,6 +91,8 @@ data class UiState(
 class MirrorSession(
     private val usb: UsbDeviceManager,
     val diagnostics: Diagnostics,
+    /** ペアリング用のホスト証明書（初回に生成して端末内に保存） */
+    private val hostIdentity: () -> HostIdentity,
 ) : UsbDeviceManager.Listener {
 
     fun interface StateObserver { fun onState(state: UiState) }
@@ -103,6 +112,13 @@ class MirrorSession(
     @Volatile private var decoder: VideoDecoder? = null
     private var processor: VideoStreamProcessor? = null
     private var reader: Thread? = null
+    private var muxLink: MuxUsbLink? = null
+    private var mux: UsbMux? = null
+    private var pairingThread: Thread? = null
+    @Volatile private var pairingState: PairingAgent.State? = null
+    /** ペアリング完了後も映像が始まらない場合の自動再接続（1 回のみ） */
+    private var restartAfterPairing = 0
+    private var forceAutoStartOnce = false
     private var reenumDeadline = 0L
     private var activationAttempts = 0
     private var muxConfigId: Int? = null
@@ -207,6 +223,10 @@ class MirrorSession(
             diagnostics.log("device unplugged; auto start re-armed")
             update { it.copy(suppressedUntilReplug = false) }
         }
+        if (usb.appleDevices().isEmpty()) {
+            restartAfterPairing = 0
+            forceAutoStartOnce = false
+        }
     }
 
     // ================= 状態遷移（制御スレッド） =================
@@ -237,7 +257,11 @@ class MirrorSession(
 
     private fun tryAutoStart() {
         val s = state
-        if (s.phase != Phase.IDLE || !s.autoStart || s.suppressedUntilReplug) return
+        if (s.phase != Phase.IDLE) return
+        if (forceAutoStartOnce) {
+            if (pickDevice() == null) return
+            forceAutoStartOnce = false
+        } else if (!s.autoStart || s.suppressedUntilReplug) return
         if (!usb.isUsbHostSupported) { fail(ErrorKind.NO_USB_HOST, "この端末は USB Host に対応していません。"); return }
         val d = pickDevice() ?: return
         diagnostics.log("auto start for ${d.deviceName}")
@@ -381,7 +405,83 @@ class MirrorSession(
         }
         transport = t
         startReader(t)
+        startPairing(conn, device, qtInfo)
     }
+
+    /**
+     * 同じ構成内の usbmux インターフェースで lockdown に接続し、ペアリング（信頼）とセッション確立を行う。
+     * iPhone は信頼されていないホストへは PING 以降の画面転送を開始しないと考えられるため（実機検証 2 回目の所見）。
+     */
+    private fun startPairing(conn: UsbDeviceConnection, device: UsbDevice, qtInfo: io.github.sekimotosa.c2mirror.usb.ConfigurationInfo) {
+        val token = sessionToken
+        val muxInfo = AppleUsb.findInterface(qtInfo, AppleUsb.SUBCLASS_USBMUX)
+        val iface = muxInfo?.let { device.findConfiguration(qtInfo.id)?.findInterface(it.id, it.alternateSetting) }
+        val inEp = iface?.let { UsbTransport.findBulk(it, true) }
+        val outEp = iface?.let { UsbTransport.findBulk(it, false) }
+        if (iface == null || inEp == null || outEp == null) {
+            diagnostics.pairing = "usbmux インターフェースなし"
+            return
+        }
+        val link = MuxUsbLink(conn, iface, inEp, outEp)
+        if (!link.claim()) {
+            diagnostics.pairing = "usbmux インターフェースの確保に失敗"
+            diagnostics.log("pairing: claim usbmux interface #${iface.id} failed")
+            return
+        }
+        val m = UsbMux({ link.write(it) }, { diagnostics.log(it) })
+        muxLink = link
+        mux = m
+        link.start({ b, o, l -> m.onUsbData(b, o, l) }, { e -> diagnostics.log("usbmux rx error: ${e.message}") })
+        val agent = PairingAgent(
+            mux = m,
+            identity = hostIdentity,
+            log = { diagnostics.log(it) },
+            onState = { st, detail -> ctl.post { onPairingState(token, st, detail) } },
+            isCancelled = { token != sessionToken },
+        )
+        pairingState = PairingAgent.State.CONNECTING
+        pairingThread = Thread({ agent.run() }, "c2m-pairing").apply { start() }
+    }
+
+    private fun onPairingState(token: Int, st: PairingAgent.State, detail: String?) {
+        if (token != sessionToken) return
+        pairingState = st
+        diagnostics.pairing = when (st) {
+            PairingAgent.State.CONNECTING -> "lockdown 接続中"
+            PairingAgent.State.WAITING_USER_TRUST -> "iPhone の「信頼」待ち"
+            PairingAgent.State.LOCKED -> "iPhone がロック中（パスコードで解除が必要）"
+            PairingAgent.State.PAIRED -> "ペアリング成功"
+            PairingAgent.State.SESSION_OK -> "信頼済み・セッション確立（iOS ${detail ?: "?"}）"
+            PairingAgent.State.DENIED -> "iPhone で「信頼しない」が選択された"
+            PairingAgent.State.FAILED -> "失敗: ${detail ?: "?"}"
+        }
+        diagnostics.log("pairing: ${diagnostics.pairing}")
+        update { it.copy(pairing = st) }
+        when (st) {
+            PairingAgent.State.DENIED -> {
+                teardown(graceful = false, restoreUsbmux = true)
+                fail(ErrorKind.PAIRING_FAILED, "iPhone で「信頼しない」が選択されました。ケーブルを抜き差しして、「信頼」をタップしてください。")
+            }
+            PairingAgent.State.SESSION_OK -> {
+                // 信頼済みになっても映像が始まらなければ、構成を戻して一度だけ自動で再接続する
+                ctl.postDelayed({
+                    if (token == sessionToken && state.phase in setOf(Phase.WAITING_PING, Phase.NEGOTIATING) &&
+                        restartAfterPairing < 1) {
+                        restartAfterPairing++
+                        diagnostics.log("trusted but no stream yet; restarting QuickTime session once")
+                        forceAutoStartOnce = true
+                        teardown(graceful = false, restoreUsbmux = true)
+                    }
+                }, RESTART_AFTER_PAIRING_MS)
+            }
+            else -> Unit
+        }
+    }
+
+    private val pairingBusy get() = pairingState in setOf(
+        PairingAgent.State.CONNECTING, PairingAgent.State.WAITING_USER_TRUST,
+        PairingAgent.State.LOCKED, PairingAgent.State.PAIRED,
+    )
 
     private fun readActiveConfiguration(conn: UsbDeviceConnection): Int? {
         val b = ByteArray(1)
@@ -406,6 +506,7 @@ class MirrorSession(
                     firstVideo = false
                     diagnostics.firstVideoPacketAt = SystemClock.uptimeMillis()
                     diagnostics.log("first FEED received")
+                    ctl.post { restartAfterPairing = 0 }
                     ctl.post { if (token == sessionToken) update { it.copy(phase = Phase.STREAMING) } }
                 }
                 proc.onSample(sample)
@@ -440,18 +541,26 @@ class MirrorSession(
             ctl.post { onReaderExit(token, err) }
         }, "c2m-usb-rx").apply { start() }
 
-        ctl.postDelayed({
-            if (token == sessionToken && state.phase == Phase.WAITING_PING) {
-                teardown(graceful = false, restoreUsbmux = true)
-                fail(ErrorKind.NO_PING, "iPhone から応答（PING）がありません。iPhone のロックを解除して再接続してください。")
+        val started = SystemClock.uptimeMillis()
+        lateinit var check: Runnable
+        check = Runnable {
+            if (token != sessionToken) return@Runnable
+            val elapsed = SystemClock.uptimeMillis() - started
+            // ペアリング（iPhone での「信頼」操作待ち）の間はタイムアウトを延長する
+            if (pairingBusy && elapsed < PAIRING_WAIT_MAX_MS) { ctl.postDelayed(check, 1000); return@Runnable }
+            when {
+                state.phase == Phase.WAITING_PING && elapsed >= PING_TIMEOUT_MS -> {
+                    teardown(graceful = false, restoreUsbmux = true)
+                    fail(ErrorKind.NO_PING, "iPhone から応答（PING）がありません。iPhone のロックを解除して再接続してください。")
+                }
+                state.phase in setOf(Phase.WAITING_PING, Phase.NEGOTIATING) && elapsed >= STREAM_START_TIMEOUT_MS -> {
+                    teardown(graceful = true, restoreUsbmux = true)
+                    fail(ErrorKind.STREAM_START_FAILED, "映像転送を開始できませんでした（映像パケット未受信）。")
+                }
+                state.phase in setOf(Phase.WAITING_PING, Phase.NEGOTIATING) -> ctl.postDelayed(check, 1000)
             }
-        }, PING_TIMEOUT_MS)
-        ctl.postDelayed({
-            if (token == sessionToken && state.phase in setOf(Phase.WAITING_PING, Phase.NEGOTIATING)) {
-                teardown(graceful = true, restoreUsbmux = true)
-                fail(ErrorKind.STREAM_START_FAILED, "映像転送を開始できませんでした（映像パケット未受信）。")
-            }
-        }, STREAM_START_TIMEOUT_MS)
+        }
+        ctl.postDelayed(check, 1000)
     }
 
     private fun onProtocolEvent(token: Int, e: ProtocolEvent, proc: VideoStreamProcessor) {
@@ -533,6 +642,13 @@ class MirrorSession(
         t?.stop()
         reader?.join(1500)
         reader = null
+        mux?.closeAll()
+        mux = null
+        muxLink?.close()
+        muxLink = null
+        pairingThread?.join(1000)
+        pairingThread = null
+        pairingState = null
         t?.close()
         transport = null
         protocol = null
@@ -555,7 +671,7 @@ class MirrorSession(
         }
         connection = null
         diagnostics.sessionState = "停止"
-        update { it.copy(phase = Phase.IDLE) }
+        update { it.copy(phase = Phase.IDLE, pairing = null) }
     }
 
     private fun fail(kind: ErrorKind, detail: String, suppress: Boolean = true) {
@@ -584,7 +700,8 @@ class MirrorSession(
             append("FEED=${p?.videoSamples ?: 0} EAT=${p?.audioSamples ?: 0} feedErr=${p?.feedParseErrors ?: 0} unknown=${p?.unknownPackets ?: 0}")
             append(" queued=${d?.framesQueued ?: 0} rendered=${d?.framesRendered ?: 0} dropped=${d?.framesDropped ?: 0}")
             append(" backlogFlush=${d?.backlogFlushes ?: 0} decodeLatency=%.1fms".format(d?.decodeLatencyMs ?: 0.0))
-            append(" rx=${(t?.bytesRead ?: 0) / 1024}KiB tx=${(t?.bytesWritten ?: 0) / 1024}KiB rxMode=${t?.rxMode ?: "-"}")
+            append(" rx=${t?.bytesRead ?: 0}B tx=${t?.bytesWritten ?: 0}B rxMode=${t?.rxMode ?: "-"}")
+            mux?.let { append(" mux in/out=${it.packetsIn}/${it.packetsOut}") }
             d?.lastError?.let { append(" decoderLastError=$it") }
         }
     }
@@ -616,6 +733,8 @@ class MirrorSession(
         const val MAX_ACTIVATION_ATTEMPTS = 2
         const val PING_TIMEOUT_MS = 6000L
         const val STREAM_START_TIMEOUT_MS = 15000L
+        const val PAIRING_WAIT_MAX_MS = 120_000L
+        const val RESTART_AFTER_PAIRING_MS = 5000L
         const val CLOSE_TIMEOUT_MS = 3000L
         const val REPLUG_DEBOUNCE_MS = 4000L
     }
